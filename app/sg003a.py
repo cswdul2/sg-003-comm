@@ -29,13 +29,18 @@ def crc16_modbus(data: bytes) -> int:
     return crc & 0xFFFF
 
 
-def append_crc(payload: bytes) -> bytes:
+def append_crc(payload: bytes, *, high_first: bool = False) -> bytes:
     c = crc16_modbus(payload)
-    return payload + bytes([c & 0xFF, (c >> 8) & 0xFF])
+    lo = c & 0xFF
+    hi = (c >> 8) & 0xFF
+    if high_first:
+        return payload + bytes([hi, lo])
+    return payload + bytes([lo, hi])
 
 
 FC_READ_U16 = 0x64
 FC_READ_FLOAT = 0x66
+FC_WRITE_U16 = 0x65
 
 # PLC addresses from manual (holding register map).
 REG_FIRMWARE = 40001
@@ -107,11 +112,13 @@ class SG003AClient:
         self,
         port: str,
         slave_id: int = 1,
-        baudrate: int = 19200,
+        baudrate: int = 9600,
         bytesize: int = serial.EIGHTBITS,
         parity: str = serial.PARITY_NONE,
         stopbits: int = serial.STOPBITS_ONE,
         timeout_s: float = 0.35,
+        crc_high_first: bool = True,
+        read_with_count: bool = True,
     ):
         self._lock = threading.Lock()
         self._ser: Optional[serial.Serial] = None
@@ -122,6 +129,21 @@ class SG003AClient:
         self.parity = parity
         self.stopbits = stopbits
         self.timeout_s = timeout_s
+        self.crc_high_first = crc_high_first
+        self.read_with_count = read_with_count
+
+    def _build_read_u16_body(self, plc_address: int) -> bytes:
+        body = bytes([FC_READ_U16]) + plc_addr_to_pdu(plc_address)
+        if self.read_with_count:
+            body += b"\x00\x01"
+        return body
+
+    def _build_read_float_body(self, plc_address: int) -> bytes:
+        body = bytes([FC_READ_FLOAT]) + plc_addr_to_pdu(plc_address)
+        if self.read_with_count:
+            # one float is two 16-bit registers
+            body += b"\x00\x02"
+        return body
 
     def open(self) -> None:
         with self._lock:
@@ -145,7 +167,7 @@ class SG003AClient:
     def _transceive(self, pdu_body: bytes) -> bytes:
         if not self._ser or not self._ser.is_open:
             raise RuntimeError("Serial port is not open")
-        frame = append_crc(bytes([self.slave_id]) + pdu_body)
+        frame = append_crc(bytes([self.slave_id]) + pdu_body, high_first=self.crc_high_first)
         self._ser.reset_input_buffer()
         self._ser.write(frame)
         self._ser.flush()
@@ -178,7 +200,7 @@ class SG003AClient:
         """Send PDU (without CRC/slave) and append one trace row with spaced hex."""
         if not self._ser or not self._ser.is_open:
             raise RuntimeError("Serial port is not open")
-        tx = append_crc(bytes([self.slave_id]) + pdu_body)
+        tx = append_crc(bytes([self.slave_id]) + pdu_body, high_first=self.crc_high_first)
         self._ser.reset_input_buffer()
         self._ser.write(tx)
         self._ser.flush()
@@ -208,23 +230,77 @@ class SG003AClient:
             "rx_hex": rx.hex().upper(),
             "rx_spaced": _spaced(rx),
             "rx_len": len(rx),
+            "crc_order": "hi-lo" if self.crc_high_first else "lo-hi",
         }
         trace_out.append(row)
         return rx
 
+    def _split_rx_crc(self, data_without_crc: bytes, raw_crc2: bytes) -> tuple[int, int]:
+        crc_calc = crc16_modbus(data_without_crc)
+        if len(raw_crc2) != 2:
+            raise IOError("CRC length is not 2 bytes")
+        if self.crc_high_first:
+            crc_rx = (raw_crc2[0] << 8) | raw_crc2[1]
+        else:
+            crc_rx = raw_crc2[0] | (raw_crc2[1] << 8)
+        return crc_calc, crc_rx
+
     def read_u16(self, plc_address: int) -> int:
         """Read one uint16 from holding map address (4xxxx style)."""
-        body = bytes([FC_READ_U16]) + plc_addr_to_pdu(plc_address)
+        body = self._build_read_u16_body(plc_address)
         with self._lock:
             raw = self._transceive(body)
         return self._parse_read_u16_response(raw)
 
     def read_float32(self, plc_address: int) -> float:
         """Read float starting at given address (occupies two addresses)."""
-        body = bytes([FC_READ_FLOAT]) + plc_addr_to_pdu(plc_address)
+        body = self._build_read_float_body(plc_address)
         with self._lock:
             raw = self._transceive(body)
         return self._parse_read_float_response(raw)
+
+    def write_u16(self, plc_address: int, value: int) -> dict[str, Any]:
+        """
+        Write one uint16 using vendor FC 0x65.
+
+        Manual example:
+            01 65 9C 42 04 62 CRC(2B)
+        """
+        v = value & 0xFFFF
+        body = bytes([FC_WRITE_U16]) + plc_addr_to_pdu(plc_address) + struct.pack(">H", v)
+        trace: list[dict[str, Any]] = []
+        with self._lock:
+            raw = self._exchange_traced(body, plc=plc_address, kind="write_u16", fc_label="0x65", trace_out=trace)
+
+        row = trace[0] if trace else {}
+        result: dict[str, Any] = {
+            "ok": False,
+            "address": plc_address,
+            "value_u16": v,
+            "value_hex": f"0x{v:04X}",
+            "tx_spaced": row.get("tx_spaced", ""),
+            "rx_spaced": row.get("rx_spaced", ""),
+            "rx_len": row.get("rx_len", 0),
+            "crc_order": row.get("crc_order"),
+        }
+
+        # Keep validation loose for diagnostics: many devices echo request,
+        # some reply with a shortened ACK frame, some are silent.
+        if len(raw) == 0:
+            result["error"] = "No response bytes"
+            return result
+        if raw[0] != self.slave_id:
+            result["error"] = f"Unexpected slave byte: 0x{raw[0]:02X}"
+            return result
+        if len(raw) >= 2 and (raw[1] & 0x80):
+            result["error"] = f"Modbus exception frame: {raw.hex().upper()}"
+            return result
+        if len(raw) >= 2 and raw[1] != FC_WRITE_U16:
+            result["error"] = f"Unexpected function code: 0x{raw[1]:02X}"
+            return result
+
+        result["ok"] = True
+        return result
 
     def _parse_read_u16_response(self, raw: bytes) -> int:
         if len(raw) < 5:
@@ -242,8 +318,7 @@ class SG003AClient:
         if bc != 2:
             raise IOError(f"Unexpected byte count {bc}: {raw.hex()}")
         value = (raw[3] << 8) | raw[4]
-        crc_rx = raw[5] | (raw[6] << 8)
-        crc_calc = crc16_modbus(raw[:5])
+        crc_calc, crc_rx = self._split_rx_crc(raw[:5], raw[5:7])
         if crc_rx != crc_calc:
             raise IOError(f"CRC mismatch (calc {crc_calc:04X} rx {crc_rx:04X}): {raw.hex()}")
         return value & 0xFFFF
@@ -264,8 +339,7 @@ class SG003AClient:
             raise IOError(f"Unexpected float byte count {bc}: {raw.hex()}")
         # Big-endian float (Modbus/register order hi word first typical)
         fbytes = raw[3:7]
-        crc_rx = raw[7] | (raw[8] << 8)
-        crc_calc = crc16_modbus(raw[:7])
+        crc_calc, crc_rx = self._split_rx_crc(raw[:7], raw[7:9])
         if crc_rx != crc_calc:
             raise IOError(f"CRC mismatch float (calc {crc_calc:04X} rx {crc_rx:04X}): {raw.hex()}")
         return struct.unpack(">f", fbytes)[0]
@@ -277,7 +351,7 @@ class SG003AClient:
 
         def g_u16(addr: int) -> Optional[int]:
             nonlocal err
-            body = bytes([FC_READ_U16]) + plc_addr_to_pdu(addr)
+            body = self._build_read_u16_body(addr)
             try:
                 with self._lock:
                     raw = self._exchange_traced(
@@ -296,7 +370,7 @@ class SG003AClient:
 
         def g_f32(addr: int) -> Optional[float]:
             nonlocal err
-            body = bytes([FC_READ_FLOAT]) + plc_addr_to_pdu(addr)
+            body = self._build_read_float_body(addr)
             try:
                 with self._lock:
                     raw = self._exchange_traced(

@@ -58,8 +58,14 @@
     .pill.offline { background: rgba(255,107,107,0.12); border-color: rgba(255,107,107,0.35); color: var(--err); }
     main {
       padding: 1.25rem 1.5rem 2rem;
-      max-width: 1100px;
+      max-width: 1400px;
       margin: 0 auto;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: 1.2fr 0.8fr;
+      gap: 0.9rem;
+      align-items: start;
     }
     .grid {
       display: grid;
@@ -126,6 +132,47 @@
       grid-column: 1 / -1;
       overflow-x: auto;
     }
+    .controls {
+      grid-column: 1 / -1;
+      display: flex;
+      gap: 0.6rem;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    button.btn {
+      appearance: none;
+      border: 1px solid rgba(61,158,255,0.4);
+      background: rgba(61,158,255,0.15);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 0.5rem 0.8rem;
+      font-family: var(--mono);
+      cursor: pointer;
+    }
+    button.btn:hover { background: rgba(61,158,255,0.22); }
+    button.btn:disabled { opacity: 0.6; cursor: wait; }
+    select.sel {
+      border: 1px solid rgba(255,255,255,0.2);
+      background: rgba(255,255,255,0.05);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 0.45rem 0.6rem;
+      font-family: var(--mono);
+      min-width: 120px;
+    }
+    .logbox {
+      max-height: 76vh;
+      overflow: auto;
+      font-family: var(--mono);
+      font-size: 0.76rem;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-all;
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 10px;
+      padding: 0.6rem;
+      background: rgba(0,0,0,0.2);
+    }
     table.trace {
       width: 100%;
       border-collapse: collapse;
@@ -152,9 +199,31 @@
     <div class="pill" id="statusPill"><span aria-hidden="true">●</span><span id="statusText">불러오는 중</span></div>
   </header>
   <main>
-    <section class="grid" id="board"></section>
-    <section class="grid" style="margin-top: 1rem;">
-      <div class="card trace-wrap" id="traceCard" style="display:none;"></div>
+    <section class="layout">
+      <div>
+        <section class="grid">
+          <div class="card controls">
+            <label class="sub" for="portSelect">COM 포트</label>
+            <select id="portSelect" class="sel"></select>
+            <button class="btn" id="btnRefreshPorts">포트 새로고침</button>
+            <button class="btn" id="btnConnect">연결</button>
+            <button class="btn" id="btnDisconnect">해제</button>
+            <button class="btn" id="btnWriteExample">예제 쓰기 전송 (FC 0x65, 40002=0x0462)</button>
+            <div class="sub" id="writeStatus">아직 전송 안 함</div>
+          </div>
+        </section>
+        <section class="grid" id="board"></section>
+        <section class="grid" style="margin-top: 1rem;">
+          <div class="card trace-wrap" id="traceCard" style="display:none;"></div>
+        </section>
+      </div>
+      <aside>
+        <div class="card">
+          <h3>TX : RX 로깅</h3>
+          <div class="sub">최신 통신 120건 (실시간)</div>
+          <div id="txrxLog" class="logbox">로그 없음</div>
+        </div>
+      </aside>
     </section>
     <footer>
       브라우저는 로컬 API를 1초 주기로 조회합니다. 시리얼 폴링은 서버(uvicorn)에서 동일 간격으로 수행됩니다.
@@ -247,12 +316,153 @@
         </table>`;
     }
 
-    async function loop() {
+    function renderIoLog(items) {
+      const el = document.getElementById('txrxLog');
+      if (!items || !items.length) {
+        el.textContent = '로그 없음';
+        return;
+      }
+      const lines = items.slice(-120).map((it) => {
+        const ok = it.ok === true ? 'OK' : (it.ok === false ? 'FAIL' : '-');
+        const plc = it.plc != null ? String(it.plc) : '-';
+        return `[${ok}] PLC=${plc} kind=${it.kind || '-'}\nTX: ${it.tx || '-'}\nRX: ${it.rx || '-'}\n`;
+      });
+      el.textContent = lines.reverse().join('\n');
+    }
+
+    async function loadPorts() {
+      const sel = document.getElementById('portSelect');
+      const res = await fetch('/api/ports');
+      const data = await res.json();
+      const ports = data.ports || [];
+      const current = sel.value;
+      sel.innerHTML = '';
+      if (!ports.length) {
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = '포트 없음';
+        sel.appendChild(opt);
+        return;
+      }
+      for (const p of ports) {
+        const opt = document.createElement('option');
+        opt.value = p;
+        opt.textContent = p;
+        sel.appendChild(opt);
+      }
+      if (ports.includes(current)) sel.value = current;
+    }
+
+    async function connectPort() {
+      const sel = document.getElementById('portSelect');
+      const ws = document.getElementById('writeStatus');
+      if (!sel.value) return;
+      const res = await fetch('/api/connect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ port: sel.value })
+      });
+      const data = await res.json();
+      ws.textContent = data.ok ? `연결됨: ${data.port}` : `연결 실패: ${data.error || 'unknown'}`;
+    }
+
+    async function disconnectPort() {
+      await fetch('/api/disconnect', { method: 'POST' });
+      const ws = document.getElementById('writeStatus');
+      ws.textContent = '해제됨';
+    }
+
+    function renderWithData(cfg, snap) {
       const pill = document.getElementById('statusPill');
       const st = document.getElementById('statusText');
       const board = document.getElementById('board');
       const clock = document.getElementById('clock');
 
+      const cp = cfg.connected_port || cfg.port;
+      clock.textContent = `${cp} · slave ${cfg.slave_id} · ${cfg.baudrate} baud · poll ${cfg.poll_interval_s}s · 갱신: ${fmtTs(snap.ts)}`;
+
+      const errMsg = snap.error || snap.err || '';
+      const failedOpen = snap.status === 'failed_to_open_serial';
+
+      if (failedOpen || (errMsg && !snap.ts)) {
+        pill.classList.add('offline');
+        st.textContent = failedOpen ? 'COM 열기 실패' : '오류';
+      } else {
+        pill.classList.remove('offline');
+        st.textContent = errMsg ? '부분 오류(일부 레지스터)' : '수신 중';
+      }
+
+      const rows = [];
+      const h16 = snap.hex_u16 || {};
+      const hf = snap.hex_float_ieee754_be || {};
+      const lw = snap.last_write;
+      renderIoLog(snap.io_log || []);
+
+      rows.push(renderU16('펌웨어 버전 (40001)', 'uint16 읽기 (FC 0x64)', '40001', snap.firmware_u16, h16));
+      rows.push(renderSignal('입력 신호 (40002)', snap.input_signal));
+      rows.push(renderSignal('출력 신호 (40003)', snap.output_signal));
+      rows.push(renderFloat('입력값 (40004)', 'float 읽기 (FC 0x66)', '40004', snap.input_value, hf));
+      rows.push(renderFloat('출력값 (40006)', 'float 읽기 / 쓰기 맵', '40006', snap.output_value, hf));
+      rows.push(renderU16('소프트웨어 출력 모드·스위치 (40008)', 'uint16', '40008', snap.soft_mode_u16, h16));
+
+      rows.push(renderU16('능동 전류 출력 USER 상한 (40009)', 'uint16', '40009', snap.active_io_user_hi, h16));
+      rows.push(renderU16('능동 전류 출력 USER 하한 (40010)', 'uint16', '40010', snap.active_io_user_lo, h16));
+      rows.push(renderU16('전압 출력 USER 상한 (40011)', 'uint16', '40011', snap.volt_user_hi, h16));
+      rows.push(renderU16('전압 출력 USER 하한 (40012)', 'uint16', '40012', snap.volt_user_lo, h16));
+      rows.push(renderU16('패시브 전류 출력 USER 상한 (40013)', 'uint16', '40013', snap.passive_io_user_hi, h16));
+      rows.push(renderU16('패시브 전류 출력 USER 하한 (40014)', 'uint16', '40014', snap.passive_io_user_lo, h16));
+
+      if (snap.error) {
+        rows.unshift(`
+          <div class="card" style="grid-column: 1 / -1;">
+            <h3>마지막 오류</h3>
+            <div class="big" style="color: var(--err); font-size: 1rem;">${esc(snap.error)}</div>
+            <div class="sub">첫 번째 실패만 기록됩니다. 전체 맵은 가능한 항목까지 채웁니다.</div>
+          </div>`);
+      }
+
+      board.innerHTML = rows.join('');
+      const ws = document.getElementById('writeStatus');
+      if (lw && ws) {
+        if (lw.ok) {
+          ws.textContent = `최근 쓰기 성공: TX=${lw.tx_spaced || '-'} / RX=${lw.rx_spaced || '-'}`;
+        } else {
+          ws.textContent = `최근 쓰기 실패: ${lw.error || 'unknown'} / TX=${lw.tx_spaced || '-'} / RX=${lw.rx_spaced || '-'}`;
+        }
+      }
+
+      const tc = document.getElementById('traceCard');
+      const tr = snap.rtu_trace;
+      if (tr && tr.length) {
+        tc.style.display = 'block';
+        tc.innerHTML = renderTraceTable(tr);
+      } else {
+        tc.style.display = 'none';
+        tc.innerHTML = '';
+      }
+    }
+
+    async function sendExampleWrite() {
+      const btn = document.getElementById('btnWriteExample');
+      const ws = document.getElementById('writeStatus');
+      btn.disabled = true;
+      ws.textContent = '전송 중...';
+      try {
+        const res = await fetch('/api/write-example', { method: 'POST' });
+        const data = await res.json();
+        if (data.ok) {
+          ws.textContent = `성공: TX=${data.tx_spaced || '-'} / RX=${data.rx_spaced || '-'}`;
+        } else {
+          ws.textContent = `실패: ${data.error || 'unknown'} / TX=${data.tx_spaced || '-'} / RX=${data.rx_spaced || '-'}`;
+        }
+      } catch (e) {
+        ws.textContent = `요청 실패: ${e}`;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function loop() {
       try {
         const [cfgRes, snapRes] = await Promise.all([
           fetch('/api/config'),
@@ -260,67 +470,50 @@
         ]);
         const cfg = await cfgRes.json();
         const snap = await snapRes.json();
-
-        clock.textContent = `${cfg.port} · slave ${cfg.slave_id} · ${cfg.baudrate} baud · poll ${cfg.poll_interval_s}s · 갱신: ${fmtTs(snap.ts)}`;
-
-        const errMsg = snap.error || snap.err || '';
-        const failedOpen = snap.status === 'failed_to_open_serial';
-
-        if (failedOpen || (errMsg && !snap.ts)) {
-          pill.classList.add('offline');
-          st.textContent = failedOpen ? 'COM 열기 실패' : '오류';
-        } else {
-          pill.classList.remove('offline');
-          st.textContent = errMsg ? '부분 오류(일부 레지스터)' : '수신 중';
-        }
-
-        const rows = [];
-        const h16 = snap.hex_u16 || {};
-        const hf = snap.hex_float_ieee754_be || {};
-
-        rows.push(renderU16('펌웨어 버전 (40001)', 'uint16 읽기 (FC 0x64)', '40001', snap.firmware_u16, h16));
-        rows.push(renderSignal('입력 신호 (40002)', snap.input_signal));
-        rows.push(renderSignal('출력 신호 (40003)', snap.output_signal));
-        rows.push(renderFloat('입력값 (40004)', 'float 읽기 (FC 0x66)', '40004', snap.input_value, hf));
-        rows.push(renderFloat('출력값 (40006)', 'float 읽기 / 쓰기 맵', '40006', snap.output_value, hf));
-        rows.push(renderU16('소프트웨어 출력 모드·스위치 (40008)', 'uint16', '40008', snap.soft_mode_u16, h16));
-
-        rows.push(renderU16('능동 전류 출력 USER 상한 (40009)', 'uint16', '40009', snap.active_io_user_hi, h16));
-        rows.push(renderU16('능동 전류 출력 USER 하한 (40010)', 'uint16', '40010', snap.active_io_user_lo, h16));
-        rows.push(renderU16('전압 출력 USER 상한 (40011)', 'uint16', '40011', snap.volt_user_hi, h16));
-        rows.push(renderU16('전압 출력 USER 하한 (40012)', 'uint16', '40012', snap.volt_user_lo, h16));
-        rows.push(renderU16('패시브 전류 출력 USER 상한 (40013)', 'uint16', '40013', snap.passive_io_user_hi, h16));
-        rows.push(renderU16('패시브 전류 출력 USER 하한 (40014)', 'uint16', '40014', snap.passive_io_user_lo, h16));
-
-        if (snap.error) {
-          rows.unshift(`
-            <div class="card" style="grid-column: 1 / -1;">
-              <h3>마지막 오류</h3>
-              <div class="big" style="color: var(--err); font-size: 1rem;">${esc(snap.error)}</div>
-              <div class="sub">첫 번째 실패만 기록됩니다. 전체 맵은 가능한 항목까지 채웁니다.</div>
-            </div>`);
-        }
-
-        board.innerHTML = rows.join('');
-
-        const tc = document.getElementById('traceCard');
-        const tr = snap.rtu_trace;
-        if (tr && tr.length) {
-          tc.style.display = 'block';
-          tc.innerHTML = renderTraceTable(tr);
-        } else {
-          tc.style.display = 'none';
-          tc.innerHTML = '';
-        }
+        renderWithData(cfg, snap);
       } catch (e) {
+        const pill = document.getElementById('statusPill');
+        const st = document.getElementById('statusText');
+        const board = document.getElementById('board');
         pill.classList.add('offline');
         st.textContent = 'API 실패';
         board.innerHTML = `<div class="card" style="grid-column:1/-1"><h3>연결</h3><div class="sub">${e}</div></div>`;
       }
     }
 
-    setInterval(loop, 1000);
-    loop();
+    async function startRealtime() {
+      let cfg = null;
+      try {
+        const cfgRes = await fetch('/api/config');
+        cfg = await cfgRes.json();
+      } catch (_) {
+        await loop();
+      }
+
+      const es = new EventSource('/api/stream');
+      es.onmessage = (ev) => {
+        try {
+          const payload = JSON.parse(ev.data);
+          const snap = payload.snapshot || {};
+          snap.last_write = payload.last_write;
+          if (cfg) renderWithData(cfg, snap);
+        } catch (_) {
+          // ignore parse error and keep stream alive
+        }
+      };
+      es.onerror = () => {
+        // Fallback: keep UI fresh even if SSE is interrupted.
+        setInterval(loop, 1000);
+        es.close();
+      };
+    }
+
+    document.getElementById('btnWriteExample').addEventListener('click', sendExampleWrite);
+    document.getElementById('btnRefreshPorts').addEventListener('click', loadPorts);
+    document.getElementById('btnConnect').addEventListener('click', connectPort);
+    document.getElementById('btnDisconnect').addEventListener('click', disconnectPort);
+    loadPorts().catch(() => {});
+    startRealtime();
   </script>
 </body>
 </html>

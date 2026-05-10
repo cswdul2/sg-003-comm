@@ -2,11 +2,16 @@
 Run (시리얼 사용 시 reload 비권장 — 포트 점유 충돌 가능):
     python -m uvicorn app.main:app --host 127.0.0.1 --port 8765
 Open: http://127.0.0.1:8765/
+
+통신이 확인된 기본 조합(환경변수 미설정 시):
+  - slave=5, baud=9600, crc_order=hi-lo, read_frame=with-count
+  - FC 0x64/0x66 + 주소 뒤 개수(00 01 / 00 02), 레지스터는 40001~40014 순차 개별 읽기
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import threading
 from dataclasses import asdict
@@ -14,8 +19,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI
+from pydantic import BaseModel
 from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from serial.tools import list_ports
 
 from app.sg003a import SG003AClient
 
@@ -29,8 +37,12 @@ def env_int(name: str, default: int) -> int:
 
 SERIAL_PORT = os.environ.get("SG003A_PORT", "COM3")
 SLAVE_ID = env_int("SG003A_SLAVE", 1)
-BAUDRATE = env_int("SG003A_BAUD", 19200)
+BAUDRATE = env_int("SG003A_BAUD", 9600)
 POLL_INTERVAL = float(os.environ.get("SG003A_POLL_MS", "1000")) / 1000.0
+CRC_ORDER = os.environ.get("SG003A_CRC_ORDER", "lo-hi").strip().lower()
+CRC_HIGH_FIRST = CRC_ORDER not in ("lo-hi", "low-high", "modbus")
+READ_FRAME_MODE = os.environ.get("SG003A_READ_FRAME", "with-count").strip().lower()
+READ_WITH_COUNT = READ_FRAME_MODE not in ("addr-only", "legacy")
 
 
 def _is_serial_permission_denied(exc: BaseException) -> bool:
@@ -67,25 +79,61 @@ class PollerState:
     def __init__(self) -> None:
         self.snapshot: Optional[dict[str, Any]] = None
         self.running = False
+        self.last_write: Optional[dict[str, Any]] = None
+        self.version = 0
+        self.cond = threading.Condition()
+        self.connected = False
+        self.connected_port: Optional[str] = None
+        self.io_log: list[dict[str, Any]] = []
 
 
 state = PollerState()
 poll_thread: Optional[threading.Thread] = None
 _client: Optional[SG003AClient] = None
+_client_lock = threading.Lock()
 
 
-def poll_loop_actual(client: SG003AClient) -> None:
+class ConnectRequest(BaseModel):
+    port: str
+
+
+def _push_log(row: dict[str, Any]) -> None:
+    state.io_log.append(row)
+    if len(state.io_log) > 300:
+        state.io_log = state.io_log[-300:]
+
+
+def poll_loop_actual() -> None:
     import time as _time
 
     while state.running:
+        with _client_lock:
+            client = _client
+        if client is None:
+            _time.sleep(0.2)
+            continue
         snap = client.read_full_map_safe()
         d = asdict(snap)
         d["_connection"] = {
-            "port": SERIAL_PORT,
+            "port": state.connected_port or SERIAL_PORT,
             "slave_id": SLAVE_ID,
             "baudrate": BAUDRATE,
         }
-        state.snapshot = d
+        with state.cond:
+            state.snapshot = d
+            for t in d.get("rtu_trace", []):
+                _push_log(
+                    {
+                        "ts": d.get("ts"),
+                        "kind": t.get("kind"),
+                        "plc": t.get("plc"),
+                        "tx": t.get("tx_spaced"),
+                        "rx": t.get("rx_spaced"),
+                        "ok": t.get("parse_ok"),
+                    }
+                )
+            state.version += 1
+            state.cond.notify_all()
         _time.sleep(POLL_INTERVAL)
 
 
@@ -98,82 +146,221 @@ async def startup() -> None:
 
     baud_src = "SG003A_BAUD 환경 변수" if (os.environ.get("SG003A_BAUD", "").strip() != "") else "코드 기본값"
     print(
-        f"[SG-003A] 시리얼: {SERIAL_PORT} @ {BAUDRATE} baud, slave={SLAVE_ID} ({baud_src})",
+        f"[SG-003A] 시리얼: {SERIAL_PORT} @ {BAUDRATE} baud, slave={SLAVE_ID}, crc={'hi-lo' if CRC_HIGH_FIRST else 'lo-hi'}, read_frame={'with-count' if READ_WITH_COUNT else 'addr-only'} ({baud_src})",
         flush=True,
     )
 
-    client = SG003AClient(port=SERIAL_PORT, slave_id=SLAVE_ID, baudrate=BAUDRATE)
-    _client = client
+    def connect_default_port() -> Optional[str]:
+        global _client
+        try:
+            c = SG003AClient(
+                port=SERIAL_PORT,
+                slave_id=SLAVE_ID,
+                baudrate=BAUDRATE,
+                crc_high_first=CRC_HIGH_FIRST,
+                read_with_count=READ_WITH_COUNT,
+            )
+            c.open()
+            with _client_lock:
+                _client = c
+            state.connected = True
+            state.connected_port = SERIAL_PORT
+            return None
+        except Exception as e:
+            with _client_lock:
+                _client = None
+            state.connected = False
+            state.connected_port = None
+            return serial_open_error_with_hints(e)
 
-    async def opener() -> None:
-        loop = asyncio.get_running_loop()
+    state.running = True
+    open_err = connect_default_port()
+    with state.cond:
+        state.snapshot = {
+            "ts": None,
+            "status": "connected" if open_err is None else "failed_to_open_serial",
+            "error": open_err,
+            "_connection": {
+                "port": state.connected_port,
+                "slave_id": SLAVE_ID,
+                "baudrate": BAUDRATE,
+            },
+        }
+        state.version += 1
+        state.cond.notify_all()
 
-        def o() -> None:
-            client.open()
+    if open_err is None:
 
-        await loop.run_in_executor(None, o)
-
-    async def opener_with_retry() -> None:
-        for _ in range(3):
-            try:
-                await opener()
-
-                def first_read() -> None:
-                    snap = client.read_full_map_safe()
-                    d = asdict(snap)
-                    d["_connection"] = {
-                        "port": SERIAL_PORT,
-                        "slave_id": SLAVE_ID,
-                        "baudrate": BAUDRATE,
-                    }
-                    state.snapshot = d
-
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, first_read)
-
-                state.running = True
-                t = threading.Thread(target=poll_loop_actual, args=(client,), daemon=True)
-                poll_thread = t
-                t.start()
+        def first_read_once() -> None:
+            with _client_lock:
+                c = _client
+            if c is None:
                 return
-            except Exception as e:
-                state.snapshot = {
-                    "ts": None,
-                    "error": serial_open_error_with_hints(e),
-                    "status": "failed_to_open_serial",
-                    "port": SERIAL_PORT,
-                    "slave_id": SLAVE_ID,
-                    "baudrate": BAUDRATE,
-                }
-                await asyncio.sleep(1)
+            snap = c.read_full_map_safe()
+            d = asdict(snap)
+            d["_connection"] = {
+                "port": state.connected_port or SERIAL_PORT,
+                "slave_id": SLAVE_ID,
+                "baudrate": BAUDRATE,
+            }
+            with state.cond:
+                state.snapshot = d
+                for trow in d.get("rtu_trace", []):
+                    _push_log(
+                        {
+                            "ts": d.get("ts"),
+                            "kind": trow.get("kind"),
+                            "plc": trow.get("plc"),
+                            "tx": trow.get("tx_spaced"),
+                            "rx": trow.get("rx_spaced"),
+                            "ok": trow.get("parse_ok"),
+                        }
+                    )
+                state.version += 1
+                state.cond.notify_all()
 
-    asyncio.create_task(opener_with_retry())
+        threading.Thread(target=first_read_once, daemon=True).start()
+
+    t = threading.Thread(target=poll_loop_actual, daemon=True)
+    poll_thread = t
+    t.start()
 
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
     state.running = False
-    if _client is not None:
+    with _client_lock:
+        c = _client
+    if c is not None:
         try:
-            _client.close()
+            c.close()
         except Exception:
             pass
 
 
 @app.get("/api/config")
 async def api_config():
+    with _client_lock:
+        connected = _client is not None
     return {
         "port": SERIAL_PORT,
         "slave_id": SLAVE_ID,
         "baudrate": BAUDRATE,
+        "crc_order": "hi-lo" if CRC_HIGH_FIRST else "lo-hi",
+        "read_frame": "with-count" if READ_WITH_COUNT else "addr-only",
         "poll_interval_s": POLL_INTERVAL,
+        "connected": connected,
+        "connected_port": state.connected_port,
     }
 
 
 @app.get("/api/snapshot")
 async def api_snapshot():
     snap = state.snapshot
-    return snap or {"error": "not_ready", "status": "initializing"}
+    if not snap:
+        return {"error": "not_ready", "status": "initializing", "last_write": state.last_write}
+    out = dict(snap)
+    out["last_write"] = state.last_write
+    out["io_log"] = state.io_log[-120:]
+    return out
+
+
+@app.get("/api/ports")
+async def api_ports():
+    ports = [p.device for p in list_ports.comports()]
+    return {"ports": ports}
+
+
+@app.post("/api/connect")
+async def api_connect(req: ConnectRequest):
+    global _client
+    port = req.port.strip()
+    if not port:
+        return {"ok": False, "error": "empty_port"}
+    try:
+        c = SG003AClient(
+            port=port,
+            slave_id=SLAVE_ID,
+            baudrate=BAUDRATE,
+            crc_high_first=CRC_HIGH_FIRST,
+            read_with_count=READ_WITH_COUNT,
+        )
+        c.open()
+        with _client_lock:
+            if _client is not None:
+                try:
+                    _client.close()
+                except Exception:
+                    pass
+            _client = c
+        with state.cond:
+            state.connected = True
+            state.connected_port = port
+            state.version += 1
+            state.cond.notify_all()
+        return {"ok": True, "port": port}
+    except Exception as e:
+        return {"ok": False, "error": serial_open_error_with_hints(e)}
+
+
+@app.post("/api/disconnect")
+async def api_disconnect():
+    global _client
+    with _client_lock:
+        c = _client
+        _client = None
+    if c is not None:
+        try:
+            c.close()
+        except Exception:
+            pass
+    with state.cond:
+        state.connected = False
+        state.connected_port = None
+        state.version += 1
+        state.cond.notify_all()
+    return {"ok": True}
+
+
+@app.get("/api/stream")
+async def api_stream():
+    def gen():
+        last_ver = -1
+        while True:
+            with state.cond:
+                if state.version == last_ver:
+                    state.cond.wait(timeout=15.0)
+                current_ver = state.version
+                snap = state.snapshot
+                lw = state.last_write
+            payload = {"version": current_ver, "snapshot": snap, "last_write": lw}
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            last_ver = current_ver
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.post("/api/write-example")
+async def api_write_example():
+    """
+    Manual write example:
+    - register: 40002 (0x9C42)
+    - value: 0x0462  (mV + J thermocouple type in manual illustration)
+    """
+    with _client_lock:
+        c = _client
+    if c is None:
+        return {"ok": False, "error": "client_not_initialized"}
+    try:
+        res = c.write_u16(40002, 0x0462)
+    except Exception as e:
+        res = {"ok": False, "error": str(e)}
+    with state.cond:
+        state.last_write = res
+        _push_log({"ts": None, "kind": "write_u16", "plc": 40002, "tx": res.get("tx_spaced"), "rx": res.get("rx_spaced"), "ok": res.get("ok")})
+        state.version += 1
+        state.cond.notify_all()
+    return res
 
 
 static_dir = Path(__file__).resolve().parent.parent / "static"
