@@ -226,7 +226,7 @@
       </aside>
     </section>
     <footer>
-      브라우저는 로컬 API를 1초 주기로 조회합니다. 시리얼 폴링은 서버(uvicorn)에서 동일 간격으로 수행됩니다.
+      실시간은 SSE(/api/stream)·폴백은 /api/snapshot. 맵은 번지마다 읽을 때마다 반영하며, 번지 간 간격·스윕 후 대기는 서버 환경변수 SG003A_INTER_READ_MS · SG003A_POLL_MS(ms) 입니다.
     </footer>
   </main>
   <script>
@@ -243,6 +243,16 @@
       if (ts == null) return '—';
       const d = new Date(ts * 1000);
       return d.toLocaleString();
+    }
+
+    function fmtWallClock(t) {
+      if (t == null || t === undefined) return '—';
+      const sec = typeof t === 'number' ? t : Number(t);
+      if (!Number.isFinite(sec)) return String(t);
+      const d = new Date(sec * 1000);
+      if (isNaN(d.getTime())) return String(t);
+      const ms = d.getMilliseconds().toString().padStart(3, '0');
+      return d.toLocaleString('ko-KR', { hour12: false }) + '.' + ms;
     }
 
     function renderSignal(cardTitle, sig) {
@@ -325,7 +335,8 @@
       const lines = items.slice(-120).map((it) => {
         const ok = it.ok === true ? 'OK' : (it.ok === false ? 'FAIL' : '-');
         const plc = it.plc != null ? String(it.plc) : '-';
-        return `[${ok}] PLC=${plc} kind=${it.kind || '-'}\nTX: ${it.tx || '-'}\nRX: ${it.rx || '-'}\n`;
+        const wall = fmtWallClock(it.logged_at);
+        return `${wall}\n[${ok}] PLC=${plc} kind=${it.kind || '-'}\nTX: ${it.tx || '-'}\nRX: ${it.rx || '-'}\n`;
       });
       el.textContent = lines.reverse().join('\n');
     }
@@ -379,7 +390,13 @@
       const clock = document.getElementById('clock');
 
       const cp = cfg.connected_port || cfg.port;
-      clock.textContent = `${cp} · slave ${cfg.slave_id} · ${cfg.baudrate} baud · poll ${cfg.poll_interval_s}s · 갱신: ${fmtTs(snap.ts)}`;
+      const blk = cfg.block_read_first === false ? 'block off' : 'block on';
+      const igapMs = cfg.inter_request_ms_effective != null ? Number(cfg.inter_request_ms_effective) : null;
+      let igapWarn = '';
+      if (cfg.inter_read_gap_note === 'remapped_1000ms_to_100ms') igapWarn = ' (1000→100 보정)';
+      else if (cfg.inter_read_gap_note === 'clamped_inter_read_to_100ms') igapWarn = ' (느린값→100ms)';
+      const igap = igapMs != null && Number.isFinite(igapMs) ? ` · gap ${igapMs}ms${igapWarn}` : '';
+      clock.textContent = `${cp} · slave ${cfg.slave_id} · ${cfg.baudrate} baud · ${blk}${igap} · poll ${cfg.poll_interval_s}s · 갱신: ${fmtTs(snap.ts)}`;
 
       const errMsg = snap.error || snap.err || '';
       const failedOpen = snap.status === 'failed_to_open_serial';

@@ -3,9 +3,9 @@ Run (시리얼 사용 시 reload 비권장 — 포트 점유 충돌 가능):
     python -m uvicorn app.main:app --host 127.0.0.1 --port 8765
 Open: http://127.0.0.1:8765/
 
-통신이 확인된 기본 조합(환경변수 미설정 시):
-  - slave=5, baud=9600, crc_order=hi-lo, read_frame=with-count
-  - FC 0x64/0x66 + 주소 뒤 개수(00 01 / 00 02), 레지스터는 40001~40014 순차 개별 읽기
+기본 조합(환경변수 미설정 시, 장비 매뉴얼과 맞게 조정):
+  - slave=1, baud=115200, crc_order=lo-hi(표준 Modbus 기본), read_frame=with-count
+  - 읽기: 순차 RTU. SG003A_INTER_READ_MS(ms)→번지 간 sleep; 미설정 100ms. 값이 250ms 초과면(또는 1000 근처) 기본적으로 100ms로 줄임 → 그대로 쓰려면 SG003A_INTER_READ_FORCE_EXACT=1.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import asyncio
 import json
 import os
 import threading
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
@@ -25,7 +26,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from serial.tools import list_ports
 
-from app.sg003a import SG003AClient
+from app.sg003a import DeviceSnapshot, SG003AClient
 
 
 def env_int(name: str, default: int) -> int:
@@ -37,12 +38,61 @@ def env_int(name: str, default: int) -> int:
 
 SERIAL_PORT = os.environ.get("SG003A_PORT", "COM3")
 SLAVE_ID = env_int("SG003A_SLAVE", 1)
-BAUDRATE = env_int("SG003A_BAUD", 9600)
-POLL_INTERVAL = float(os.environ.get("SG003A_POLL_MS", "1000")) / 1000.0
+BAUDRATE = env_int("SG003A_BAUD", 115200)
+POLL_INTERVAL = float(os.environ.get("SG003A_POLL_MS", "0")) / 1000.0
 CRC_ORDER = os.environ.get("SG003A_CRC_ORDER", "lo-hi").strip().lower()
 CRC_HIGH_FIRST = CRC_ORDER not in ("lo-hi", "low-high", "modbus")
 READ_FRAME_MODE = os.environ.get("SG003A_READ_FRAME", "with-count").strip().lower()
 READ_WITH_COUNT = READ_FRAME_MODE not in ("addr-only", "legacy")
+BLOCK_READ_ENV = os.environ.get("SG003A_BLOCK_READ", "0").strip().lower()
+BLOCK_READ_ENABLED = BLOCK_READ_ENV not in ("0", "false", "no", "off")
+# 순차 RTU: 번지 RX 끝난 뒤 다음 TX까지 대기(ms). 코드·콘솔·/api/config에 적용값 표시.
+# SG003A_INTER_READ_MS=1000 은 「번지마다 1초」(로그 줄 간격도 ~1s). 빠르게 하려면 100(0.1s) 전후.
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _inter_read_ms_env() -> tuple[float, Optional[str]]:
+    raw = os.environ.get("SG003A_INTER_READ_MS")
+    unset = raw is None or str(raw).strip() == ""
+    s = ("100" if unset else str(raw).strip()) or "100"
+    try:
+        val = float(s)
+    except ValueError:
+        return 100.0, None
+    val = max(0.0, val)
+    # 진짜로 긴 간격(ms) 그대로 쓰려면 SG003A_INTER_READ_FORCE_EXACT=1 (또는 1초 대기 명시 확인)
+    force_exact = _truthy_env("SG003A_INTER_READ_FORCE_EXACT") or _truthy_env(
+        "SG003A_INTER_READ_CONFIRM_1S"
+    )
+    note: Optional[str] = None
+    if not unset and not force_exact:
+        # 990~1010 등 흔한 오타 외에, 250ms 넘으면 로그 줄 간격이 체감상 병목이 되기 쉬움 → 기본은 100ms 로 맞춤
+        if 990.0 <= val <= 1010.0:
+            note = "remapped_1000ms_to_100ms"
+            val = 100.0
+        elif val >= 250.0:
+            note = "clamped_inter_read_to_100ms"
+            val = 100.0
+    return val, note
+
+
+_INTER_READ_MS_EFFECTIVE, _INTER_GAP_REMAP_NOTE = _inter_read_ms_env()
+INTER_REQUEST_DELAY_S = max(0.0, _INTER_READ_MS_EFFECTIVE / 1000.0)
+
+
+def _serial_timeout_ms_env() -> float:
+    raw = os.environ.get("SG003A_SERIAL_TIMEOUT_MS")
+    if raw is None or str(raw).strip() == "":
+        return 350.0
+    try:
+        return float(str(raw).strip())
+    except ValueError:
+        return 350.0
+
+
+_SERIAL_TIMEOUT_MS_EFFECTIVE = _serial_timeout_ms_env()
+SERIAL_TIMEOUT_S = max(0.05, min(3.0, _SERIAL_TIMEOUT_MS_EFFECTIVE / 1000.0))
 
 
 def _is_serial_permission_denied(exc: BaseException) -> bool:
@@ -91,6 +141,7 @@ state = PollerState()
 poll_thread: Optional[threading.Thread] = None
 _client: Optional[SG003AClient] = None
 _client_lock = threading.Lock()
+_map_read_guard = threading.Lock()
 
 
 class ConnectRequest(BaseModel):
@@ -98,9 +149,124 @@ class ConnectRequest(BaseModel):
 
 
 def _push_log(row: dict[str, Any]) -> None:
-    state.io_log.append(row)
+    entry = dict(row)
+    entry.setdefault("logged_at", time.time())
+    state.io_log.append(entry)
     if len(state.io_log) > 300:
         state.io_log = state.io_log[-300:]
+
+
+_MAP_STEP_TOP_KEYS: tuple[tuple[str, ...], ...] = (
+    ("firmware_u16",),
+    ("input_signal",),
+    ("output_signal",),
+    ("input_value",),
+    ("output_value",),
+    ("soft_mode_u16",),
+    ("active_io_user_hi",),
+    ("active_io_user_lo",),
+    ("volt_user_hi",),
+    ("volt_user_lo",),
+    ("passive_io_user_hi",),
+    ("passive_io_user_lo",),
+)
+
+_MAP_STEP_HEX_U16: tuple[Optional[str], ...] = (
+    "40001",
+    "40002",
+    "40003",
+    None,
+    None,
+    "40008",
+    "40009",
+    "40010",
+    "40011",
+    "40012",
+    "40013",
+    "40014",
+)
+
+_MAP_STEP_HEX_FLOAT: tuple[Optional[str], ...] = (
+    None,
+    None,
+    None,
+    "40004",
+    "40006",
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+)
+
+
+def _merge_rtu_snapshot(
+    prev: Optional[dict[str, Any]], new: dict[str, Any], completed_steps: int
+) -> dict[str, Any]:
+    """이번 스윕에서 completed_steps(1~12)까지 읽은 필드만 덮어쓰고, 나머지 카드 값은 prev 유지."""
+    merged: dict[str, Any] = dict(prev) if prev else {}
+    n = min(max(completed_steps, 0), len(_MAP_STEP_TOP_KEYS))
+    for s in range(n):
+        for key in _MAP_STEP_TOP_KEYS[s]:
+            merged[key] = new[key]
+    h16: dict[str, Any] = dict(merged.get("hex_u16") or {})
+    hf: dict[str, Any] = dict(merged.get("hex_float_ieee754_be") or {})
+    nu16: dict[str, Any] = new.get("hex_u16") or {}
+    nf: dict[str, Any] = new.get("hex_float_ieee754_be") or {}
+    for s in range(n):
+        ku = _MAP_STEP_HEX_U16[s]
+        if ku is not None and ku in nu16:
+            h16[ku] = nu16[ku]
+        elif ku is not None and ku not in nu16:
+            h16.pop(ku, None)
+        kf = _MAP_STEP_HEX_FLOAT[s]
+        if kf is not None and kf in nf:
+            hf[kf] = nf[kf]
+        elif kf is not None and kf not in nf:
+            hf.pop(kf, None)
+    merged["hex_u16"] = h16
+    merged["hex_float_ieee754_be"] = hf
+    merged["rtu_trace"] = new.get("rtu_trace") or []
+    merged["ts"] = new.get("ts")
+    merged["error"] = new.get("error")
+    if "_connection" in new:
+        merged["_connection"] = new["_connection"]
+    return merged
+
+
+def _publish_map_read_partial(
+    snap: DeviceSnapshot, log_tail_from: dict[str, int], completed_steps: int
+) -> None:
+    """순차 읽기마다 반영. 미읽은 번지는 기존 스냅샷 값 유지. io_log는 새 trace 행만."""
+    d = asdict(snap)
+    d["_connection"] = {
+        "port": state.connected_port or SERIAL_PORT,
+        "slave_id": SLAVE_ID,
+        "baudrate": BAUDRATE,
+    }
+    with state.cond:
+        tr = d.get("rtu_trace") or []
+        start_i = log_tail_from.get("i", 0)
+        for trow in tr[start_i:]:
+            _push_log(
+                {
+                    "ts": d.get("ts"),
+                    "logged_at": float(trow["rx_done_at"])
+                    if trow.get("rx_done_at") is not None
+                    else time.time(),
+                    "kind": trow.get("kind"),
+                    "plc": trow.get("plc"),
+                    "tx": trow.get("tx_spaced"),
+                    "rx": trow.get("rx_spaced"),
+                    "ok": trow.get("parse_ok"),
+                }
+            )
+        log_tail_from["i"] = len(tr)
+        state.snapshot = _merge_rtu_snapshot(state.snapshot, d, completed_steps)
+        state.version += 1
+        state.cond.notify_all()
 
 
 def poll_loop_actual() -> None:
@@ -112,29 +278,18 @@ def poll_loop_actual() -> None:
         if client is None:
             _time.sleep(0.2)
             continue
-        snap = client.read_full_map_safe()
-        d = asdict(snap)
-        d["_connection"] = {
-            "port": state.connected_port or SERIAL_PORT,
-            "slave_id": SLAVE_ID,
-            "baudrate": BAUDRATE,
-        }
-        with state.cond:
-            state.snapshot = d
-            for t in d.get("rtu_trace", []):
-                _push_log(
-                    {
-                        "ts": d.get("ts"),
-                        "kind": t.get("kind"),
-                        "plc": t.get("plc"),
-                        "tx": t.get("tx_spaced"),
-                        "rx": t.get("rx_spaced"),
-                        "ok": t.get("parse_ok"),
-                    }
-                )
-            state.version += 1
-            state.cond.notify_all()
-        _time.sleep(POLL_INTERVAL)
+        t0 = _time.monotonic()
+        with _map_read_guard:
+            log_tail_from = {"i": 0}
+
+            def on_partial(s: DeviceSnapshot, done_steps: int) -> None:
+                _publish_map_read_partial(s, log_tail_from, done_steps)
+
+            client.read_full_map_safe(on_partial=on_partial)
+        elapsed = _time.monotonic() - t0
+        remainder = POLL_INTERVAL - elapsed
+        if remainder > 0:
+            _time.sleep(remainder)
 
 
 app = FastAPI(title="SG-003A viewer")
@@ -149,6 +304,28 @@ async def startup() -> None:
         f"[SG-003A] 시리얼: {SERIAL_PORT} @ {BAUDRATE} baud, slave={SLAVE_ID}, crc={'hi-lo' if CRC_HIGH_FIRST else 'lo-hi'}, read_frame={'with-count' if READ_WITH_COUNT else 'addr-only'} ({baud_src})",
         flush=True,
     )
+    ie = os.environ.get("SG003A_INTER_READ_MS")
+    ie_src = "환경변수" if ie is not None and str(ie).strip() != "" else "기본 100"
+    print(
+        f"[SG-003A] RTU 번지 간격: {_INTER_READ_MS_EFFECTIVE:g} ms → 다음 TX까지 {INTER_REQUEST_DELAY_S:g} s 대기 ({ie_src}; 100=0.1s)",
+        flush=True,
+    )
+    if _INTER_GAP_REMAP_NOTE == "remapped_1000ms_to_100ms":
+        print(
+            "[SG-003A] ※ SG003A_INTER_READ_MS≈1000 은 「1초/번지」입니다. 빠르게 하려던 경우 자동으로 100ms 로 보정했습니다. 정말 그대로 쓰려면 SG003A_INTER_READ_FORCE_EXACT=1",
+            flush=True,
+        )
+    elif _INTER_GAP_REMAP_NOTE == "clamped_inter_read_to_100ms":
+        print(
+            "[SG003A] ※ SG003A_INTER_READ_MS 가 250ms 초과였습니다 → 100ms 로 맞췄습니다. 환경값 그대로 쓰려면 SG003A_INTER_READ_FORCE_EXACT=1",
+            flush=True,
+        )
+    st = os.environ.get("SG003A_SERIAL_TIMEOUT_MS")
+    st_src = "환경변수" if st is not None and str(st).strip() != "" else "기본 350"
+    print(
+        f"[SG-003A] 시리얼 read 타임아웃: {_SERIAL_TIMEOUT_MS_EFFECTIVE:g} ms → pyserial timeout {SERIAL_TIMEOUT_S:g} s ({st_src}, SG003A_SERIAL_TIMEOUT_MS)",
+        flush=True,
+    )
 
     def connect_default_port() -> Optional[str]:
         global _client
@@ -157,8 +334,11 @@ async def startup() -> None:
                 port=SERIAL_PORT,
                 slave_id=SLAVE_ID,
                 baudrate=BAUDRATE,
+                timeout_s=SERIAL_TIMEOUT_S,
                 crc_high_first=CRC_HIGH_FIRST,
                 read_with_count=READ_WITH_COUNT,
+                block_read_first=BLOCK_READ_ENABLED,
+                inter_request_delay_s=INTER_REQUEST_DELAY_S,
             )
             c.open()
             with _client_lock:
@@ -196,28 +376,13 @@ async def startup() -> None:
                 c = _client
             if c is None:
                 return
-            snap = c.read_full_map_safe()
-            d = asdict(snap)
-            d["_connection"] = {
-                "port": state.connected_port or SERIAL_PORT,
-                "slave_id": SLAVE_ID,
-                "baudrate": BAUDRATE,
-            }
-            with state.cond:
-                state.snapshot = d
-                for trow in d.get("rtu_trace", []):
-                    _push_log(
-                        {
-                            "ts": d.get("ts"),
-                            "kind": trow.get("kind"),
-                            "plc": trow.get("plc"),
-                            "tx": trow.get("tx_spaced"),
-                            "rx": trow.get("rx_spaced"),
-                            "ok": trow.get("parse_ok"),
-                        }
-                    )
-                state.version += 1
-                state.cond.notify_all()
+            with _map_read_guard:
+                log_tail_from = {"i": 0}
+
+                def on_partial(s: DeviceSnapshot, done_steps: int) -> None:
+                    _publish_map_read_partial(s, log_tail_from, done_steps)
+
+                c.read_full_map_safe(on_partial=on_partial)
 
         threading.Thread(target=first_read_once, daemon=True).start()
 
@@ -248,6 +413,11 @@ async def api_config():
         "baudrate": BAUDRATE,
         "crc_order": "hi-lo" if CRC_HIGH_FIRST else "lo-hi",
         "read_frame": "with-count" if READ_WITH_COUNT else "addr-only",
+        "block_read_first": BLOCK_READ_ENABLED,
+        "inter_request_delay_s": INTER_REQUEST_DELAY_S,
+        "inter_request_ms_effective": _INTER_READ_MS_EFFECTIVE,
+        "inter_read_gap_note": _INTER_GAP_REMAP_NOTE,
+        "serial_timeout_ms_effective": _SERIAL_TIMEOUT_MS_EFFECTIVE,
         "poll_interval_s": POLL_INTERVAL,
         "connected": connected,
         "connected_port": state.connected_port,
@@ -282,8 +452,11 @@ async def api_connect(req: ConnectRequest):
             port=port,
             slave_id=SLAVE_ID,
             baudrate=BAUDRATE,
+            timeout_s=SERIAL_TIMEOUT_S,
             crc_high_first=CRC_HIGH_FIRST,
             read_with_count=READ_WITH_COUNT,
+            block_read_first=BLOCK_READ_ENABLED,
+            inter_request_delay_s=INTER_REQUEST_DELAY_S,
         )
         c.open()
         with _client_lock:
@@ -333,7 +506,12 @@ async def api_stream():
                 current_ver = state.version
                 snap = state.snapshot
                 lw = state.last_write
-            payload = {"version": current_ver, "snapshot": snap, "last_write": lw}
+                log_tail = state.io_log[-120:]
+            snap_out = None
+            if snap is not None:
+                snap_out = dict(snap)
+                snap_out["io_log"] = list(log_tail)
+            payload = {"version": current_ver, "snapshot": snap_out, "last_write": lw}
             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
             last_ver = current_ver
 

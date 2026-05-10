@@ -12,7 +12,7 @@ import struct
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import serial
 
@@ -112,13 +112,15 @@ class SG003AClient:
         self,
         port: str,
         slave_id: int = 1,
-        baudrate: int = 9600,
+        baudrate: int = 115200,
         bytesize: int = serial.EIGHTBITS,
         parity: str = serial.PARITY_NONE,
         stopbits: int = serial.STOPBITS_ONE,
         timeout_s: float = 0.35,
         crc_high_first: bool = True,
         read_with_count: bool = True,
+        block_read_first: bool = False,
+        inter_request_delay_s: float = 0.1,
     ):
         self._lock = threading.Lock()
         self._ser: Optional[serial.Serial] = None
@@ -131,6 +133,8 @@ class SG003AClient:
         self.timeout_s = timeout_s
         self.crc_high_first = crc_high_first
         self.read_with_count = read_with_count
+        self.block_read_first = block_read_first
+        self.inter_request_delay_s = max(0.0, float(inter_request_delay_s))
 
     def _build_read_u16_body(self, plc_address: int) -> bytes:
         body = bytes([FC_READ_U16]) + plc_addr_to_pdu(plc_address)
@@ -144,6 +148,41 @@ class SG003AClient:
             # one float is two 16-bit registers
             body += b"\x00\x02"
         return body
+
+    def _build_read_u16_block_body(self, start_plc_address: int, word_count: int) -> bytes:
+        """Vendor FC 0x64 여러 워드 — 표준 Holding 다건과 같이 시작주소+N."""
+        body = bytes([FC_READ_U16]) + plc_addr_to_pdu(start_plc_address)
+        if self.read_with_count:
+            body += struct.pack(">H", word_count & 0xFFFF)
+        return body
+
+    def _parse_read_u16_block_response(self, raw: bytes, word_count: int) -> list[int]:
+        """응답: addr, fc, byte_count=N*2, 데이터..., CRC."""
+        if len(raw) < 5:
+            raise IOError(f"Short response ({len(raw)} bytes): {raw.hex()}")
+        if raw[0] != self.slave_id:
+            raise IOError(f"Unexpected slave in response: {raw.hex()}")
+        if raw[1] & 0x80:
+            raise IOError(f"Modbus exception: {raw.hex()}")
+        if raw[1] != FC_READ_U16:
+            raise IOError(f"Unexpected function code: {raw.hex()}")
+        expected_bc = word_count * 2
+        bc = raw[2]
+        if bc != expected_bc:
+            raise IOError(f"Unexpected byte count {bc} expected {expected_bc}: {raw.hex()}")
+        need = 3 + bc + 2
+        if len(raw) < need:
+            raise IOError(f"Truncated block payload ({len(raw)} < {need}): {raw.hex()}")
+        payload = raw[3 : 3 + bc]
+        crc_calc, crc_rx = self._split_rx_crc(raw[: 3 + bc], raw[3 + bc : need])
+        if crc_rx != crc_calc:
+            raise IOError(f"CRC mismatch block (calc {crc_calc:04X} rx {crc_rx:04X}): {raw.hex()}")
+        out: list[int] = []
+        for i in range(0, len(payload), 2):
+            out.append((payload[i] << 8) | payload[i + 1])
+        if len(out) != word_count:
+            raise IOError(f"Word unpack length {len(out)} != {word_count}: {raw.hex()}")
+        return out
 
     def open(self) -> None:
         with self._lock:
@@ -171,20 +210,18 @@ class SG003AClient:
         self._ser.reset_input_buffer()
         self._ser.write(frame)
         self._ser.flush()
-        # Read full response: variable length; wait for at least 5 bytes then drain
-        deadline = time.monotonic() + max(self.timeout_s, 0.5)
+        # 최소 5바이트(addr+fc+…) 확보 후 CRC 등 나머지 수신. 상한은 pyserial timeout 기준(0.5s 최소 대기 제거).
+        deadline = time.monotonic() + max(0.08, self.timeout_s) + 0.04
         buf = bytearray()
         while time.monotonic() < deadline:
             chunk = self._ser.read(256)
             if chunk:
                 buf.extend(chunk)
                 if len(buf) >= 5:
-                    # minimal response: addr fc ... crc2
                     break
             else:
-                time.sleep(0.01)
-        # brief trailing read for slow links
-        time.sleep(0.02)
+                time.sleep(0.005)
+        time.sleep(0.005)
         buf.extend(self._ser.read(256))
         return bytes(buf)
 
@@ -204,7 +241,7 @@ class SG003AClient:
         self._ser.reset_input_buffer()
         self._ser.write(tx)
         self._ser.flush()
-        deadline = time.monotonic() + max(self.timeout_s, 0.5)
+        deadline = time.monotonic() + max(0.08, self.timeout_s) + 0.04
         buf = bytearray()
         while time.monotonic() < deadline:
             chunk = self._ser.read(256)
@@ -213,10 +250,11 @@ class SG003AClient:
                 if len(buf) >= 5:
                     break
             else:
-                time.sleep(0.01)
-        time.sleep(0.02)
+                time.sleep(0.005)
+        time.sleep(0.005)
         buf.extend(self._ser.read(256))
         rx = bytes(buf)
+        rx_done_wall = time.time()
 
         def _spaced(data: bytes) -> str:
             return " ".join(f"{b:02X}" for b in data)
@@ -231,6 +269,7 @@ class SG003AClient:
             "rx_spaced": _spaced(rx),
             "rx_len": len(rx),
             "crc_order": "hi-lo" if self.crc_high_first else "lo-hi",
+            "rx_done_at": rx_done_wall,
         }
         trace_out.append(row)
         return rx
@@ -344,12 +383,129 @@ class SG003AClient:
             raise IOError(f"CRC mismatch float (calc {crc_calc:04X} rx {crc_rx:04X}): {raw.hex()}")
         return struct.unpack(">f", fbytes)[0]
 
-    def read_full_map_safe(self) -> DeviceSnapshot:
+    def read_full_map_safe(
+        self,
+        *,
+        on_partial: Optional[Callable[[DeviceSnapshot, int], None]] = None,
+    ) -> DeviceSnapshot:
         ts = time.time()
         err: Optional[str] = None
         trace: list[dict[str, Any]] = []
 
-        def g_u16(addr: int) -> Optional[int]:
+        def sig_dict(v: Optional[int]) -> Optional[dict]:
+            if v is None:
+                return None
+            return decode_signal_word(v)
+
+        def u16_hex(a: Optional[int]) -> Optional[str]:
+            if a is None:
+                return None
+            return f"0x{a:04X}"
+
+        def f32_hex(f: Optional[float]) -> Optional[str]:
+            if f is None:
+                return None
+            return struct.pack(">f", f).hex().upper()
+
+        def snapshot_from_regs(
+            *,
+            fw: Optional[int],
+            ins: Optional[int],
+            outs: Optional[int],
+            inv: Optional[float],
+            outv: Optional[float],
+            sm: Optional[int],
+            aio_hi: Optional[int],
+            aio_lo: Optional[int],
+            v_hi: Optional[int],
+            v_lo: Optional[int],
+            p_hi: Optional[int],
+            p_lo: Optional[int],
+            snap_err: Optional[str],
+        ) -> DeviceSnapshot:
+            hex_u16: dict[str, str] = {}
+            for key, val in [
+                ("40001", fw),
+                ("40008", sm),
+                ("40009", aio_hi),
+                ("40010", aio_lo),
+                ("40011", v_hi),
+                ("40012", v_lo),
+                ("40013", p_hi),
+                ("40014", p_lo),
+            ]:
+                h = u16_hex(val)
+                if h is not None:
+                    hex_u16[key] = h
+            for key, val in [("40002", ins), ("40003", outs)]:
+                h = u16_hex(val)
+                if h is not None:
+                    hex_u16[key] = h
+            hex_f: dict[str, str] = {}
+            ih = f32_hex(inv)
+            if ih is not None:
+                hex_f["40004"] = ih
+            oh = f32_hex(outv)
+            if oh is not None:
+                hex_f["40006"] = oh
+            return DeviceSnapshot(
+                ts=ts,
+                firmware_u16=fw,
+                input_signal=sig_dict(ins),
+                output_signal=sig_dict(outs),
+                input_value=inv,
+                output_value=outv,
+                soft_mode_u16=sm,
+                active_io_user_hi=aio_hi,
+                active_io_user_lo=aio_lo,
+                volt_user_hi=v_hi,
+                volt_user_lo=v_lo,
+                passive_io_user_hi=p_hi,
+                passive_io_user_lo=p_lo,
+                error=snap_err,
+                hex_u16=hex_u16,
+                hex_float_ieee754_be=hex_f,
+                rtu_trace=trace,
+            )
+
+        if self.block_read_first and self.read_with_count:
+            try:
+                nw = 14
+                body = self._build_read_u16_block_body(REG_FIRMWARE, nw)
+                with self._lock:
+                    raw = self._exchange_traced(
+                        body,
+                        plc=REG_FIRMWARE,
+                        kind="u16_block",
+                        fc_label="0x64",
+                        trace_out=trace,
+                    )
+                w = self._parse_read_u16_block_response(raw, nw)
+                trace[-1]["parse_ok"] = True
+                snap = snapshot_from_regs(
+                    fw=w[0],
+                    ins=w[1],
+                    outs=w[2],
+                    inv=struct.unpack(">f", struct.pack(">HH", w[3], w[4]))[0],
+                    outv=struct.unpack(">f", struct.pack(">HH", w[5], w[6]))[0],
+                    sm=w[7],
+                    aio_hi=w[8],
+                    aio_lo=w[9],
+                    v_hi=w[10],
+                    v_lo=w[11],
+                    p_hi=w[12],
+                    p_lo=w[13],
+                    snap_err=None,
+                )
+                if on_partial is not None:
+                    on_partial(snap, 12)
+                return snap
+            except Exception as e:
+                if trace:
+                    trace[-1]["parse_ok"] = False
+                    trace[-1]["parse_err"] = str(e)
+
+        def read_u16_one(addr: int) -> Optional[int]:
             nonlocal err
             body = self._build_read_u16_body(addr)
             try:
@@ -368,7 +524,7 @@ class SG003AClient:
                     err = str(e)
                 return None
 
-        def g_f32(addr: int) -> Optional[float]:
+        def read_f32_one(addr: int) -> Optional[float]:
             nonlocal err
             body = self._build_read_float_body(addr)
             try:
@@ -387,77 +543,96 @@ class SG003AClient:
                     err = str(e)
                 return None
 
-        fw = g_u16(REG_FIRMWARE)
-        ins = g_u16(REG_INPUT_SIGNAL)
-        outs = g_u16(REG_OUTPUT_SIGNAL)
-        inv = g_f32(REG_INPUT_VALUE)
-        outv = g_f32(REG_OUTPUT_VALUE)
-        sm = g_u16(REG_SOFT_MODE)
-        aio_hi = g_u16(REG_ACTIVE_IO_USER_HI)
-        aio_lo = g_u16(REG_ACTIVE_IO_USER_LO)
-        v_hi = g_u16(REG_VOLT_USER_HI)
-        v_lo = g_u16(REG_VOLT_USER_LO)
-        p_hi = g_u16(REG_PASSIVE_IO_USER_HI)
-        p_lo = g_u16(REG_PASSIVE_IO_USER_LO)
+        # 12 RTU round-trips (40001~40014 맵: float 2회 + u16 10회). 요청 사이 간격만 적용(마지막 뒤는 sleep 없음).
+        steps: list[tuple[str, int]] = [
+            ("u16", REG_FIRMWARE),
+            ("u16", REG_INPUT_SIGNAL),
+            ("u16", REG_OUTPUT_SIGNAL),
+            ("f32", REG_INPUT_VALUE),
+            ("f32", REG_OUTPUT_VALUE),
+            ("u16", REG_SOFT_MODE),
+            ("u16", REG_ACTIVE_IO_USER_HI),
+            ("u16", REG_ACTIVE_IO_USER_LO),
+            ("u16", REG_VOLT_USER_HI),
+            ("u16", REG_VOLT_USER_LO),
+            ("u16", REG_PASSIVE_IO_USER_HI),
+            ("u16", REG_PASSIVE_IO_USER_LO),
+        ]
+        def unpack12(vals: list[Optional[Any]]) -> tuple:
+            pad_n: list[Optional[Any]] = [None] * 12
+            for j in range(min(len(vals), 12)):
+                pad_n[j] = vals[j]
+            return tuple(pad_n)
 
-        def sig_dict(v: Optional[int]) -> Optional[dict]:
-            if v is None:
-                return None
-            return decode_signal_word(v)
+        seq: list[Optional[Any]] = []
+        d = self.inter_request_delay_s
+        n = len(steps)
+        fw: Optional[int]
+        ins: Optional[int]
+        outs: Optional[int]
+        inv: Optional[float]
+        outv: Optional[float]
+        sm: Optional[int]
+        aio_hi: Optional[int]
+        aio_lo: Optional[int]
+        v_hi: Optional[int]
+        v_lo: Optional[int]
+        p_hi: Optional[int]
+        p_lo: Optional[int]
 
-        def u16_hex(a: Optional[int]) -> Optional[str]:
-            if a is None:
-                return None
-            return f"0x{a:04X}"
+        for i, (kind, addr) in enumerate(steps):
+            if kind == "u16":
+                seq.append(read_u16_one(addr))
+            else:
+                seq.append(read_f32_one(addr))
+            (
+                fw,
+                ins,
+                outs,
+                inv,
+                outv,
+                sm,
+                aio_hi,
+                aio_lo,
+                v_hi,
+                v_lo,
+                p_hi,
+                p_lo,
+            ) = unpack12(seq)
+            if on_partial is not None:
+                on_partial(
+                    snapshot_from_regs(
+                        fw=fw,
+                        ins=ins,
+                        outs=outs,
+                        inv=inv,
+                        outv=outv,
+                        sm=sm,
+                        aio_hi=aio_hi,
+                        aio_lo=aio_lo,
+                        v_hi=v_hi,
+                        v_lo=v_lo,
+                        p_hi=p_hi,
+                        p_lo=p_lo,
+                        snap_err=err,
+                    ),
+                    i + 1,
+                )
+            if d > 0 and i < n - 1:
+                time.sleep(d)
 
-        def f32_hex(f: Optional[float]) -> Optional[str]:
-            if f is None:
-                return None
-            return struct.pack(">f", f).hex().upper()
-
-        hex_u16: dict[str, str] = {}
-        for key, val in [
-            ("40001", fw),
-            ("40008", sm),
-            ("40009", aio_hi),
-            ("40010", aio_lo),
-            ("40011", v_hi),
-            ("40012", v_lo),
-            ("40013", p_hi),
-            ("40014", p_lo),
-        ]:
-            h = u16_hex(val)
-            if h is not None:
-                hex_u16[key] = h
-        for key, val in [("40002", ins), ("40003", outs)]:
-            h = u16_hex(val)
-            if h is not None:
-                hex_u16[key] = h
-
-        hex_f: dict[str, str] = {}
-        ih = f32_hex(inv)
-        if ih is not None:
-            hex_f["40004"] = ih
-        oh = f32_hex(outv)
-        if oh is not None:
-            hex_f["40006"] = oh
-
-        return DeviceSnapshot(
-            ts=ts,
-            firmware_u16=fw,
-            input_signal=sig_dict(ins),
-            output_signal=sig_dict(outs),
-            input_value=inv,
-            output_value=outv,
-            soft_mode_u16=sm,
-            active_io_user_hi=aio_hi,
-            active_io_user_lo=aio_lo,
-            volt_user_hi=v_hi,
-            volt_user_lo=v_lo,
-            passive_io_user_hi=p_hi,
-            passive_io_user_lo=p_lo,
-            error=err,
-            hex_u16=hex_u16,
-            hex_float_ieee754_be=hex_f,
-            rtu_trace=trace,
+        return snapshot_from_regs(
+            fw=fw,
+            ins=ins,
+            outs=outs,
+            inv=inv,
+            outv=outv,
+            sm=sm,
+            aio_hi=aio_hi,
+            aio_lo=aio_lo,
+            v_hi=v_hi,
+            v_lo=v_lo,
+            p_hi=p_hi,
+            p_lo=p_lo,
+            snap_err=err,
         )
