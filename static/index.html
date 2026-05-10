@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SG-003A Modbus 뷰어</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --text: #e7ecf3;
+      --muted: #8b97a8;
+      --accent: #3d9eff;
+      --err: #ff6b6b;
+      --ok: #63e6be;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: radial-gradient(1200px 600px at 20% -10%, #1e2d45 0%, var(--bg) 55%);
+      color: var(--text);
+    }
+    header {
+      padding: 1.25rem 1.5rem;
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem 1rem;
+      align-items: baseline;
+      justify-content: space-between;
+    }
+    h1 {
+      margin: 0;
+      font-size: 1.35rem;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+    .meta {
+      font-size: 0.9rem;
+      color: var(--muted);
+      font-family: var(--mono);
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.2rem 0.55rem;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      font-family: var(--mono);
+      background: rgba(61,158,255,0.15);
+      color: var(--accent);
+      border: 1px solid rgba(61,158,255,0.25);
+    }
+    .pill.offline { background: rgba(255,107,107,0.12); border-color: rgba(255,107,107,0.35); color: var(--err); }
+    main {
+      padding: 1.25rem 1.5rem 2rem;
+      max-width: 1100px;
+      margin: 0 auto;
+    }
+    .grid {
+      display: grid;
+      gap: 0.85rem;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    }
+    .card {
+      background: linear-gradient(160deg, rgba(255,255,255,0.04), transparent 40%);
+      border: 1px solid rgba(255,255,255,0.07);
+      border-radius: 12px;
+      padding: 1rem 1.1rem;
+    }
+    .card h3 {
+      margin: 0 0 0.65rem;
+      font-size: 0.82rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+    }
+    .big {
+      font-size: 1.65rem;
+      font-weight: 600;
+      font-family: var(--mono);
+      letter-spacing: -0.03em;
+    }
+    .sub {
+      margin-top: 0.35rem;
+      font-size: 0.85rem;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+    dl {
+      margin: 0;
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 0.35rem 0.85rem;
+      font-size: 0.9rem;
+      align-items: start;
+    }
+    dt {
+      margin: 0;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+    dd {
+      margin: 0;
+      font-family: var(--mono);
+      word-break: break-all;
+    }
+    footer {
+      margin-top: 1rem;
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+    .hexline {
+      margin-top: 0.5rem;
+      font-family: var(--mono);
+      font-size: 0.78rem;
+      color: var(--ok);
+      word-break: break-all;
+    }
+    .trace-wrap {
+      grid-column: 1 / -1;
+      overflow-x: auto;
+    }
+    table.trace {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: var(--mono);
+      font-size: 0.72rem;
+    }
+    table.trace th, table.trace td {
+      border: 1px solid rgba(255,255,255,0.08);
+      padding: 0.35rem 0.45rem;
+      vertical-align: top;
+      text-align: left;
+    }
+    table.trace th { color: var(--muted); font-weight: 600; }
+    table.trace .ok { color: var(--ok); }
+    table.trace .bad { color: var(--err); }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>SG-003A · Holding map</h1>
+      <div class="meta" id="clock">—</div>
+    </div>
+    <div class="pill" id="statusPill"><span aria-hidden="true">●</span><span id="statusText">불러오는 중</span></div>
+  </header>
+  <main>
+    <section class="grid" id="board"></section>
+    <section class="grid" style="margin-top: 1rem;">
+      <div class="card trace-wrap" id="traceCard" style="display:none;"></div>
+    </section>
+    <footer>
+      브라우저는 로컬 API를 1초 주기로 조회합니다. 시리얼 폴링은 서버(uvicorn)에서 동일 간격으로 수행됩니다.
+    </footer>
+  </main>
+  <script>
+    function esc(s) {
+      if (s == null || s === undefined) return '';
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function fmtTs(ts) {
+      if (ts == null) return '—';
+      const d = new Date(ts * 1000);
+      return d.toLocaleString();
+    }
+
+    function renderSignal(cardTitle, sig) {
+      if (!sig) {
+        return `<div class="card"><h3>${esc(cardTitle)}</h3><div class="sub">통신 오류 또는 미수신</div></div>`;
+      }
+      return `
+      <div class="card"><h3>${esc(cardTitle)}</h3>
+        <div class="big">${esc(sig.signal_type)}</div>
+        <div class="sub">
+          타입 코드: ${esc(sig.signal_type_code)} · TC: <strong>${esc(sig.tc_type)}</strong> · 모드: ${esc(sig.mode)}
+        </div>
+        <dl class="sub">
+          <dt>raw_u16</dt><dd>${esc(sig.raw_u16)}</dd>
+          <dt>raw_hex</dt><dd>${esc(sig.raw_hex)}</dd>
+        </dl>
+      </div>`;
+    }
+
+    function renderU16(cardTitle, subtitle, addr, val, hexU16map) {
+      const v = val == null ? '—' : String(val);
+      const hk = String(addr);
+      const hx = hexU16map && hexU16map[hk]
+        ? `<div class="hexline">HEX(u16): ${esc(hexU16map[hk])}</div>`
+        : (val != null ? `<div class="hexline">HEX(u16): 0x${Number(val >>> 0 & 0xFFFF).toString(16).toUpperCase().padStart(4, '0')}</div>` : '');
+      return `
+      <div class="card"><h3>${esc(cardTitle)}</h3>
+        <div class="big">${esc(v)}</div>
+        <div class="sub">${esc(subtitle)} (${esc(addr)})</div>${hx}
+      </div>`;
+    }
+
+    function renderFloat(cardTitle, subtitle, addr, val, hexFloatMap) {
+      const v = val == null ? '—' : (Number.isFinite(val) ? val.toFixed(6).replace(/\.?0+$/, '') : String(val));
+      const hk = String(addr);
+      const hx = hexFloatMap && hexFloatMap[hk]
+        ? `<div class="hexline">IEEE754 BE (4B): ${esc(hexFloatMap[hk])}</div>`
+        : '';
+      return `
+      <div class="card"><h3>${esc(cardTitle)}</h3>
+        <div class="big">${esc(v)}</div>
+        <div class="sub">${esc(subtitle)} (${esc(addr)})</div>${hx}
+      </div>`;
+    }
+
+    function renderTraceTable(traces) {
+      if (!traces || !traces.length) return '';
+      const rows = traces.map((t) => {
+        const ok = t.parse_ok === true;
+        const pe = t.parse_err ? esc(t.parse_err) : '';
+        const cls = ok ? 'ok' : 'bad';
+        const st = ok ? 'OK' : (pe || 'FAIL');
+        return `<tr>
+          <td>${esc(String(t.plc))}</td>
+          <td>${esc(t.kind)}</td>
+          <td>${esc(t.fc_tx)}</td>
+          <td class="${cls}">${esc(st)}</td>
+          <td style="white-space:pre-wrap;word-break:break-all;">${esc(t.tx_spaced || t.tx_hex || '')}</td>
+          <td style="white-space:pre-wrap;word-break:break-all;">${esc(t.rx_spaced || t.rx_hex || '')}</td>
+          <td>${esc(String(t.rx_len != null ? t.rx_len : ''))}</td>
+        </tr>`;
+      }).join('');
+      return `
+        <h3 style="margin:0 0 0.75rem;font-size:0.85rem;text-transform:uppercase;letter-spacing:0.06em;color:var(--muted);">RTU 프레임 로그 (마지막 1회 폴링)</h3>
+        <p class="sub" style="margin:0 0 0.75rem;">TX·RX는 시리얼에 실제로 오간 바이트입니다. 값이 비어 있거나 파싱 실패여도 RX HEX는 확인할 수 있습니다.</p>
+        <table class="trace">
+          <thead><tr>
+            <th>PLC</th><th>종류</th><th>FC</th><th>파싱</th><th>TX (spaced)</th><th>RX (spaced)</th><th>RX len</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+    }
+
+    async function loop() {
+      const pill = document.getElementById('statusPill');
+      const st = document.getElementById('statusText');
+      const board = document.getElementById('board');
+      const clock = document.getElementById('clock');
+
+      try {
+        const [cfgRes, snapRes] = await Promise.all([
+          fetch('/api/config'),
+          fetch('/api/snapshot')
+        ]);
+        const cfg = await cfgRes.json();
+        const snap = await snapRes.json();
+
+        clock.textContent = `${cfg.port} · slave ${cfg.slave_id} · ${cfg.baudrate} baud · poll ${cfg.poll_interval_s}s · 갱신: ${fmtTs(snap.ts)}`;
+
+        const errMsg = snap.error || snap.err || '';
+        const failedOpen = snap.status === 'failed_to_open_serial';
+
+        if (failedOpen || (errMsg && !snap.ts)) {
+          pill.classList.add('offline');
+          st.textContent = failedOpen ? 'COM 열기 실패' : '오류';
+        } else {
+          pill.classList.remove('offline');
+          st.textContent = errMsg ? '부분 오류(일부 레지스터)' : '수신 중';
+        }
+
+        const rows = [];
+        const h16 = snap.hex_u16 || {};
+        const hf = snap.hex_float_ieee754_be || {};
+
+        rows.push(renderU16('펌웨어 버전 (40001)', 'uint16 읽기 (FC 0x64)', '40001', snap.firmware_u16, h16));
+        rows.push(renderSignal('입력 신호 (40002)', snap.input_signal));
+        rows.push(renderSignal('출력 신호 (40003)', snap.output_signal));
+        rows.push(renderFloat('입력값 (40004)', 'float 읽기 (FC 0x66)', '40004', snap.input_value, hf));
+        rows.push(renderFloat('출력값 (40006)', 'float 읽기 / 쓰기 맵', '40006', snap.output_value, hf));
+        rows.push(renderU16('소프트웨어 출력 모드·스위치 (40008)', 'uint16', '40008', snap.soft_mode_u16, h16));
+
+        rows.push(renderU16('능동 전류 출력 USER 상한 (40009)', 'uint16', '40009', snap.active_io_user_hi, h16));
+        rows.push(renderU16('능동 전류 출력 USER 하한 (40010)', 'uint16', '40010', snap.active_io_user_lo, h16));
+        rows.push(renderU16('전압 출력 USER 상한 (40011)', 'uint16', '40011', snap.volt_user_hi, h16));
+        rows.push(renderU16('전압 출력 USER 하한 (40012)', 'uint16', '40012', snap.volt_user_lo, h16));
+        rows.push(renderU16('패시브 전류 출력 USER 상한 (40013)', 'uint16', '40013', snap.passive_io_user_hi, h16));
+        rows.push(renderU16('패시브 전류 출력 USER 하한 (40014)', 'uint16', '40014', snap.passive_io_user_lo, h16));
+
+        if (snap.error) {
+          rows.unshift(`
+            <div class="card" style="grid-column: 1 / -1;">
+              <h3>마지막 오류</h3>
+              <div class="big" style="color: var(--err); font-size: 1rem;">${esc(snap.error)}</div>
+              <div class="sub">첫 번째 실패만 기록됩니다. 전체 맵은 가능한 항목까지 채웁니다.</div>
+            </div>`);
+        }
+
+        board.innerHTML = rows.join('');
+
+        const tc = document.getElementById('traceCard');
+        const tr = snap.rtu_trace;
+        if (tr && tr.length) {
+          tc.style.display = 'block';
+          tc.innerHTML = renderTraceTable(tr);
+        } else {
+          tc.style.display = 'none';
+          tc.innerHTML = '';
+        }
+      } catch (e) {
+        pill.classList.add('offline');
+        st.textContent = 'API 실패';
+        board.innerHTML = `<div class="card" style="grid-column:1/-1"><h3>연결</h3><div class="sub">${e}</div></div>`;
+      }
+    }
+
+    setInterval(loop, 1000);
+    loop();
+  </script>
+</body>
+</html>
